@@ -1,4 +1,3 @@
-from keep_alive import keep_alive
 import os
 import logging
 import random
@@ -19,16 +18,17 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 2. Configure Gemini AI (Gemini 2.0 Flash)
+# 2. Configure Gemini AI
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# 3. Setup Long-Term Memory (Disk Storage)
+# 3. Setup Storage
 KB_FOLDER = "knowledge_base"
 os.makedirs(KB_FOLDER, exist_ok=True)
 
 # In-Memory Cache
-user_knowledge_base = {}
+user_knowledge_base = {}  # Holds the PDF Text
+user_sessions = {}        # Holds the Last Question Asked (Short-term memory)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -37,7 +37,6 @@ logging.basicConfig(
 
 # --- HELPER: RETRIEVE MEMORY ---
 def get_user_context(user_id):
-    """Checks RAM first, then Disk. Returns text or None."""
     if user_id in user_knowledge_base:
         return user_knowledge_base[user_id]
     
@@ -50,7 +49,6 @@ def get_user_context(user_id):
                 return text
         except Exception as e:
             print(f"Error reading file: {e}")
-            
     return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,7 +60,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 **Study Architect Online**\n"
         f"Status: {status}\n\n"
         "**Commands:**\n"
-        "1. 📂 **Upload PDF** (Overwrites notes).\n"
+        "1. 📂 **Upload PDF** (Notes OR Past Questions).\n"
         "2. 🔥 `/quiz` -> **Exam Mode**.\n"
         "3. 🎲 `/quiz random` -> **Random Mode**.\n"
         "4. 🔍 `/quiz [Topic]` -> **Topic Mode**."
@@ -76,7 +74,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Strictly PDFs only.")
         return
 
-    msg = await update.message.reply_text("⚙️ Processing & Saving to Brain...")
+    msg = await update.message.reply_text("⚙️ Ingesting... (I am learning your Lecturer's style)")
     
     try:
         file = await context.bot.get_file(doc.file_id)
@@ -94,7 +92,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f.write(text)
 
         os.remove(file_path)
-        await msg.edit_text(f"✅ **Saved.** I will remember this file forever.\nType `/quiz` to start.")
+        await msg.edit_text(f"✅ **Saved.** If this file contained Past Questions, I have now learned their pattern.\nType `/quiz` to test me.")
         
     except Exception as e:
         await msg.edit_text(f"❌ Failure: {str(e)}")
@@ -111,38 +109,33 @@ async def generate_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     mode = "exam"
-    prompt_context = ""
+    prompt_context = full_text[:40000]
+
+    # --- PROMPT ENGINEERING ---
+    base_instruction = (
+        f"Act as a strict Professor at UNILORIN (Geology Dept). "
+        f"Scan the notes below. IF you see Past Questions (PQs) in the text, MIMIC that style.\n"
+        f"NOTES:\n{prompt_context}\n\n"
+    )
 
     if args and args[0].lower() == "random":
         mode = "random"
         if len(full_text) > 4000:
             start = random.randint(0, len(full_text) - 4000)
-            prompt_context = full_text[start : start+4000]
+            snippet = full_text[start : start+4000]
         else:
-            prompt_context = full_text
-            
-        prompt = (
-            f"Act as a ruthless Professor. Read this random excerpt:\n---\n{prompt_context}\n---\n"
-            f"TASK: Ask ONE specific question based ONLY on this excerpt.\n"
-            f"CONSTRAINT: Max 2 sentences. Direct."
-        )
+            snippet = full_text
+        prompt = f"{base_instruction} TASK: Ask ONE question based ONLY on this random snippet: {snippet}\nCONSTRAINT: Max 2 sentences."
 
     elif args:
         mode = "topic"
         topic = " ".join(args)
-        prompt_context = full_text[:40000]
-        prompt = (
-            f"Act as a ruthless Professor. Ask ONE tough question about '{topic}' based on these notes.\n"
-            f"NOTES: {prompt_context}\n"
-            f"CONSTRAINT: Max 2 sentences."
-        )
+        prompt = f"{base_instruction} TASK: Ask ONE tough question about '{topic}'.\nCONSTRAINT: Max 2 sentences."
 
     else:
         mode = "exam"
-        prompt_context = full_text[:40000]
         prompt = (
-            f"Act as a strict Professor (Geology Dept). Scan these notes for likely Exam Questions.\n"
-            f"NOTES: {prompt_context}\n\n"
+            f"{base_instruction}"
             f"TASK: Generate ONE standard exam question.\n"
             f"PRIORITIZE: 'Differentiate', 'Discuss process', 'List factors'.\n"
             f"CONSTRAINT: Max 2 sentences. Difficult."
@@ -150,33 +143,36 @@ async def generate_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = model.generate_content(prompt)
+        question_text = response.text
+        
+        # SAVE TO SESSION (Short-Term Memory)
+        user_sessions[user_id] = question_text
+        
         icons = {"exam": "🔥", "random": "🎲", "topic": "🔍"}
-        await update.message.reply_text(f"{icons.get(mode, '📝')} **Question:**\n{response.text}")
+        await update.message.reply_text(f"{icons.get(mode, '📝')} **Question:**\n{question_text}")
     except Exception as e:
         await update.message.reply_text(f"❌ AI Error: {str(e)}")
 
-# --- THE NEW SMART CHAT HANDLER ---
+# --- INTELLIGENT CHAT HANDLER ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_input = update.message.text
     
     full_text = get_user_context(user_id)
-    
-    # If no PDF loaded, just chat normally or warn them
-    context_text = full_text[:30000] if full_text else "NO PDF LOADED."
+    last_question = user_sessions.get(user_id, "No active question.") # Retrieve memory
     
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # This prompt tells Gemini to figure out what you want
+    # This prompt now includes the LAST QUESTION
     prompt = (
-        f"You are a strict but intelligent Professor. The student just sent a message.\n"
-        f"Context Notes (If any): {context_text[:500]}... [truncated]\n\n"
+        f"You are a Professor. \n"
+        f"Context Notes: {full_text[:30000] if full_text else 'None'}\n"
+        f"Last Question You Asked: '{last_question}'\n\n"
         f"Student Message: '{user_input}'\n\n"
         f"INSTRUCTIONS:\n"
-        f"1. **IF IT'S AN ANSWER:** Grade it 0/10 based on the full notes. Correct errors ruthlessly.\n"
-        f"2. **IF IT'S A QUESTION:** Answer it briefly using facts from the notes.\n"
-        f"3. **IF IT'S CASUAL CHAT (e.g. 'Hi', 'Thanks', 'Bye'):** Reply briefly and professionally. Remind them to study.\n"
-        f"4. **IF NO PDF IS LOADED:** Tell them to upload a file first."
+        f"1. **IF ANSWERING:** Grade it 0/10 based on notes. Correct ruthlessly.\n"
+        f"2. **IF GIVING UP (e.g. 'IDK', 'Answer it'):** Provide the correct answer to the Last Question.\n"
+        f"3. **IF CHATTING:** Be professional.\n"
     )
 
     try:
@@ -186,18 +182,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 if __name__ == '__main__':
-    # WINDOWS FIX
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+    # KEEP ALIVE FOR RENDER
+    try:
+        from keep_alive import keep_alive
+        keep_alive()
+    except ImportError:
+        pass
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("quiz", generate_quiz))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
-    # Handles ALL text (Answers OR Chat)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     
-    keep_alive()
     print("🔥 System is running... Press Ctrl+C to stop.")
     app.run_polling()
